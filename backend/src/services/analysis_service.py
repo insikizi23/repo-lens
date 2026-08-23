@@ -30,11 +30,63 @@ class AnalysisService:
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
         self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+        self.openai_key = os.getenv("OPENAI_API_KEY")
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.analysis_timeout = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "120"))
 
     async def analyze_repository(self, context: RepositoryContext | RepositoryMetadata) -> RepositoryAnalysis:
         repository_context = self._coerce_context(context)
         prompt = self._build_prompt(repository_context)
+
+        # If an OpenAI API key is provided, use OpenAI as a demo-friendly hosted model.
+        if self.openai_key:
+            headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
+            body = {
+                "model": self.openai_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2,
+                "max_tokens": 1500,
+            }
+            try:
+                async with asyncio.timeout(self.analysis_timeout):
+                    response = await self.client.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers)
+                response.raise_for_status()
+            except TimeoutError as exc:
+                raise AnalysisServiceError(
+                    "The AI model took too long to respond. Try again or increase ANALYSIS_TIMEOUT_SECONDS.",
+                    status_code=504,
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                raise AnalysisServiceError("OpenAI returned an error for the request.", status_code=503) from exc
+            except httpx.HTTPError as exc:
+                raise AnalysisServiceError("OpenAI returned an unexpected network error.") from exc
+
+            try:
+                result = response.json()
+                # Support both chat completion and older completion styles
+                content = None
+                if (
+                    isinstance(result.get("choices"), list)
+                    and result["choices"]
+                    and isinstance(result["choices"][0].get("message"), dict)
+                ):
+                    content = result["choices"][0]["message"]["content"]
+                elif (
+                    isinstance(result.get("choices"), list)
+                    and result["choices"]
+                    and isinstance(result["choices"][0].get("text"), str)
+                ):
+                    content = result["choices"][0]["text"]
+
+                if content is None:
+                    raise AnalysisServiceError("OpenAI returned an unexpected response format.")
+
+                parsed = json.loads(content)
+                return RepositoryAnalysis.model_validate(parsed)
+            except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+                raise AnalysisServiceError("The model returned an invalid analysis. Please try again.") from exc
+
+        # Fallback to Ollama when OPENAI_API_KEY is not set
         payload = {
             "model": self.ollama_model,
             "stream": False,
