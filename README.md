@@ -72,10 +72,12 @@ If Ollama is already running as a desktop service, only the `ollama pull` comman
 
 ### 2. Start the backend
 
-In a second PowerShell terminal:
+In a second terminal (PowerShell or bash):
+
+Windows (PowerShell):
 
 ```powershell
-cd C:\Users\insik\Downloads\projects\repo-lens\backend
+cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -83,18 +85,40 @@ Copy-Item .env.example .env
 uvicorn src.main:app --reload --port 8000
 ```
 
+macOS / Linux (bash):
+
+```bash
+cd backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+uvicorn src.main:app --reload --port 8000
+```
+
 ### 3. Start the frontend
 
-In a third PowerShell terminal:
+In a third terminal (PowerShell or bash):
+
+Windows (PowerShell):
 
 ```powershell
-cd C:\Users\insik\Downloads\projects\repo-lens\frontend
+cd frontend
 Copy-Item .env.local.example .env.local
 npm ci
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000), then analyze a public repository such as:
+macOS / Linux (bash):
+
+```bash
+cd frontend
+cp .env.local.example .env.local
+npm ci
+npm run dev
+```
+
+Open http://localhost:3000 in your browser, then analyze a public repository such as:
 
 ```text
 https://github.com/vercel/next.js
@@ -119,17 +143,27 @@ Frontend variables are loaded from `frontend/.env.local`.
 
 ## Testing
 
-Run backend tests without a live GitHub or Ollama server:
+Run backend tests without a live GitHub or Ollama server (from the repository root):
+
+Windows (PowerShell):
 
 ```powershell
-cd C:\Users\insik\Downloads\projects\repo-lens\backend
+cd backend
 .\.venv\Scripts\python.exe -m pytest -q tests -p no:cacheprovider
 ```
 
-Type-check the frontend:
+macOS / Linux (bash):
 
-```powershell
-cd C:\Users\insik\Downloads\projects\repo-lens\frontend
+```bash
+cd backend
+source .venv/bin/activate
+python -m pytest -q tests -p no:cacheprovider
+```
+
+Type-check the frontend (from the `frontend` folder):
+
+```bash
+cd frontend
 npx tsc --noEmit
 ```
 
