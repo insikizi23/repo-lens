@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: repolens-api
+    runtime: docker
+    region: oregon
+    plan: starter
+    rootDir: backend
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    healthCheckPath: /health
+    envVars:
+      - key: OLLAMA_HOSTPORT
+        fromService:
+          type: pserv
+          name: repolens-ollama
+          property: hostport
+      - key: OLLAMA_MODEL
+        value: llama3.2:1b
+      - key: ANALYSIS_TIMEOUT_SECONDS
+        value: "120"
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+
+  # Local-model inference is private; it is not exposed to the public internet.
+  - type: pserv
+    name: repolens-ollama
+    runtime: image
+    image:
+      url: docker.io/ollama/ollama:latest
+    region: oregon
+    plan: starter
+    dockerCommand: >-
+      sh -c 'ollama serve & server_pid=$!; until ollama list >/dev/null 2>&1;
+      do sleep 1; done; ollama pull llama3.2:1b; wait $server_pid'
+    envVars:
+      - key: OLLAMA_HOST
+        value: 0.0.0.0:11434
+      - key: OLLAMA_MODELS
+        value: /opt/ollama
+    disk:
+      name: ollama-models
+      mountPath: /opt/ollama
+      sizeGB: 10
