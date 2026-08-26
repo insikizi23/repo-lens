@@ -1,6 +1,6 @@
 # RepoLens
 
-RepoLens is an AI-powered GitHub repository intelligence application. Paste a public GitHub repository URL to retrieve real repository metadata, language data, README content, and a bounded file tree, then receive structured engineering insights from a local Ollama model.
+RepoLens is an AI-powered GitHub repository intelligence application. Paste a public GitHub repository URL to retrieve real repository metadata, language data, README content, and a bounded file tree, then receive structured engineering insights from Groq or a local Ollama model.
 
 ## What It Does
 
@@ -37,7 +37,7 @@ API route → GitHubService → RepositoryContext → AnalysisService → Pydant
 - Frontend: Next.js 14, React, TypeScript, Tailwind CSS
 - Backend: FastAPI, Pydantic, HTTPX
 - Repository data: GitHub REST API
-- AI: Ollama-compatible local model
+- AI: Groq (hosted) or Ollama-compatible local model
 - Testing: Pytest with mocked GitHub and Ollama responses
 
 ## How It Works
@@ -131,6 +131,9 @@ Backend variables are loaded from `backend/.env`.
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `GITHUB_TOKEN` | No | — | Raises GitHub API rate limits for public repositories. Never expose this to the frontend. |
+| `AI_PROVIDER` | No | auto-detect | Set to `groq`, `openai`, or `ollama`. Use `groq` for the hosted free-tier setup. |
+| `GROQ_API_KEY` | Groq only | — | Groq API key. Store it only in the backend host's secret environment variables. |
+| `GROQ_MODEL` | No | `openai/gpt-oss-20b` | Groq model used for analysis. |
 | `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama API address. |
 | `OLLAMA_MODEL` | No | `llama3.2:1b` | Local model used for analysis. |
 | `ANALYSIS_TIMEOUT_SECONDS` | No | `120` | Maximum total time allowed for one model analysis. |
@@ -149,13 +152,29 @@ RepoLens deploys as two public-facing applications:
 Vercel (Next.js frontend) → Render (FastAPI API) → Render private Ollama service
 ```
 
-Ollama running on a laptop is not reachable by Vercel or Render. The included `render.yaml` therefore creates a private Render Ollama service with a 10 GB persistent disk for the `llama3.2:1b` model. Private services and persistent disks require a paid Render plan.
+The production deployment uses Groq's hosted API. The included `render.yaml` defines only the FastAPI service on Render's free plan; it does not run Ollama or need a persistent disk. Groq's free tier has request and token limits, so it is suitable for a personal portfolio project rather than unlimited production traffic.
 
 ### 1. Push this project to GitHub
 
-Commit and push the contents of `repo-lens-1` to the repository you want to deploy. Do not commit `.env`, `.env.local`, `.venv`, or `node_modules`.
+Commit and push this project to the repository you want to deploy. Do not commit `.env`, `.env.local`, `.venv`, or `node_modules`.
 
-### 2. Deploy the backend and private Ollama service on Render
+### 2. Deploy the backend on Render
+
+1. In Render, select **New → Web Service** and connect the GitHub repository.
+2. Set the Root Directory to `backend`, choose Docker, and select the free instance type.
+3. Add these environment variables:
+
+   ```text
+   AI_PROVIDER=groq
+   GROQ_API_KEY=<your Groq secret key>
+   GROQ_MODEL=openai/gpt-oss-20b
+   CORS_ORIGINS=https://<your-vercel-project>.vercel.app
+   GITHUB_TOKEN=<optional GitHub token>
+   ```
+
+4. Deploy, then confirm `https://<your-api-name>.onrender.com/health` returns `{"status":"ok"}`.
+
+### Legacy Ollama Blueprint instructions (not used for the free Groq deployment)
 
 1. In Render, select **New → Blueprint** and connect the GitHub repository.
 2. Render discovers the root-level `render.yaml` and creates:
@@ -179,7 +198,7 @@ Commit and push the contents of `repo-lens-1` to the repository you want to depl
 4. Deploy. Vercel detects Next.js automatically.
 5. Copy the resulting Vercel URL and update the Render API service's `CORS_ORIGINS` value to that exact URL. Add your custom domain too if you use one, separated with commas.
 
-The two services must use the same Render region so the backend can reach the private Ollama service.
+For local development, set `AI_PROVIDER=ollama` and use the Ollama settings in `backend/.env.example`.
 
 ## Testing
 

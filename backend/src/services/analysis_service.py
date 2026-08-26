@@ -34,6 +34,9 @@ class AnalysisService:
             f"http://{ollama_hostport}" if ollama_hostport else "http://localhost:11434",
         )
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+        self.ai_provider = os.getenv("AI_PROVIDER", "").strip().lower()
+        self.groq_key = os.getenv("GROQ_API_KEY")
+        self.groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
         self.openai_key = os.getenv("OPENAI_API_KEY")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.analysis_timeout = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "120"))
@@ -42,53 +45,48 @@ class AnalysisService:
         repository_context = self._coerce_context(context)
         prompt = self._build_prompt(repository_context)
 
-        # If an OpenAI API key is provided, use OpenAI as a demo-friendly hosted model.
-        if self.openai_key:
-            headers = {"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"}
-            body = {
-                "model": self.openai_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 1500,
-            }
-            try:
-                async with asyncio.timeout(self.analysis_timeout):
-                    response = await self.client.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers)
-                response.raise_for_status()
-            except TimeoutError as exc:
-                raise AnalysisServiceError(
-                    "The AI model took too long to respond. Try again or increase ANALYSIS_TIMEOUT_SECONDS.",
-                    status_code=504,
-                ) from exc
-            except httpx.HTTPStatusError as exc:
-                raise AnalysisServiceError("OpenAI returned an error for the request.", status_code=503) from exc
-            except httpx.HTTPError as exc:
-                raise AnalysisServiceError("OpenAI returned an unexpected network error.") from exc
+        if self.ai_provider == "groq":
+            if not self.groq_key:
+                raise AnalysisServiceError("GROQ_API_KEY is required when AI_PROVIDER is set to groq.", status_code=500)
+            return await self._analyze_openai_compatible(
+                prompt,
+                api_key=self.groq_key,
+                model=self.groq_model,
+                base_url="https://api.groq.com/openai/v1",
+                provider_name="Groq",
+            )
 
-            try:
-                result = response.json()
-                # Support both chat completion and older completion styles
-                content = None
-                if (
-                    isinstance(result.get("choices"), list)
-                    and result["choices"]
-                    and isinstance(result["choices"][0].get("message"), dict)
-                ):
-                    content = result["choices"][0]["message"]["content"]
-                elif (
-                    isinstance(result.get("choices"), list)
-                    and result["choices"]
-                    and isinstance(result["choices"][0].get("text"), str)
-                ):
-                    content = result["choices"][0]["text"]
+        if self.ai_provider == "openai":
+            if not self.openai_key:
+                raise AnalysisServiceError("OPENAI_API_KEY is required when AI_PROVIDER is set to openai.", status_code=500)
+            return await self._analyze_openai_compatible(
+                prompt,
+                api_key=self.openai_key,
+                model=self.openai_model,
+                base_url="https://api.openai.com/v1",
+                provider_name="OpenAI",
+            )
 
-                if content is None:
-                    raise AnalysisServiceError("OpenAI returned an unexpected response format.")
+        if self.ai_provider not in {"", "ollama"}:
+            raise AnalysisServiceError("AI_PROVIDER must be one of: groq, openai, or ollama.", status_code=500)
 
-                parsed = json.loads(content)
-                return RepositoryAnalysis.model_validate(parsed)
-            except (json.JSONDecodeError, TypeError, ValidationError) as exc:
-                raise AnalysisServiceError("The model returned an invalid analysis. Please try again.") from exc
+        # Preserve convenient automatic selection for existing deployments.
+        if not self.ai_provider and self.groq_key:
+            return await self._analyze_openai_compatible(
+                prompt,
+                api_key=self.groq_key,
+                model=self.groq_model,
+                base_url="https://api.groq.com/openai/v1",
+                provider_name="Groq",
+            )
+        if not self.ai_provider and self.openai_key:
+            return await self._analyze_openai_compatible(
+                prompt,
+                api_key=self.openai_key,
+                model=self.openai_model,
+                base_url="https://api.openai.com/v1",
+                provider_name="OpenAI",
+            )
 
         # Fallback to Ollama when OPENAI_API_KEY is not set
         payload = {
@@ -128,6 +126,59 @@ class AnalysisService:
             return RepositoryAnalysis.model_validate(parsed)
         except (json.JSONDecodeError, TypeError, ValidationError) as exc:
             raise AnalysisServiceError("Ollama returned an invalid analysis. Please try again.") from exc
+
+    async def _analyze_openai_compatible(
+        self,
+        prompt: str,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str,
+        provider_name: str,
+    ) -> RepositoryAnalysis:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 1500,
+        }
+        try:
+            async with asyncio.timeout(self.analysis_timeout):
+                response = await self.client.post(f"{base_url}/chat/completions", json=body, headers=headers)
+            response.raise_for_status()
+        except TimeoutError as exc:
+            raise AnalysisServiceError(
+                "The AI model took too long to respond. Try again or increase ANALYSIS_TIMEOUT_SECONDS.",
+                status_code=504,
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise AnalysisServiceError(
+                    f"{provider_name} rate limit reached. Please try again shortly.", status_code=429
+                ) from exc
+            raise AnalysisServiceError(f"{provider_name} returned an error for the request.", status_code=503) from exc
+        except httpx.HTTPError as exc:
+            raise AnalysisServiceError(f"{provider_name} returned an unexpected network error.") from exc
+
+        try:
+            result = response.json()
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise AnalysisServiceError(f"{provider_name} returned an unexpected response format.")
+
+            first_choice = choices[0]
+            message = first_choice.get("message") if isinstance(first_choice, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, str):
+                content = first_choice.get("text") if isinstance(first_choice, dict) else None
+            if not isinstance(content, str):
+                raise AnalysisServiceError(f"{provider_name} returned an unexpected response format.")
+
+            parsed = json.loads(content)
+            return RepositoryAnalysis.model_validate(parsed)
+        except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+            raise AnalysisServiceError("The model returned an invalid analysis. Please try again.") from exc
 
     @staticmethod
     def _coerce_context(context: RepositoryContext | RepositoryMetadata) -> RepositoryContext:

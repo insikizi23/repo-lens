@@ -140,6 +140,65 @@ def test_analysis_service_uses_repository_context_and_validates_model_response()
     assert analysis.folder_responsibilities == ["backend: API and analysis services"]
 
 
+def test_analysis_service_uses_groq_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_request: dict[str, object] = {}
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured_request["url"] = str(request.url)
+        captured_request["authorization"] = request.headers["authorization"]
+        captured_request["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "executive_summary": "A repository.",
+                                    "technologies_used": ["Python"],
+                                    "architecture_overview": "A service.",
+                                    "main_components": ["backend"],
+                                    "folder_responsibilities": ["backend: API"],
+                                    "suggested_improvements": ["Add tests"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    context = RepositoryContext(
+        name="demo",
+        owner="acme",
+        description=None,
+        stars=0,
+        forks=0,
+        default_branch="main",
+        primary_language="Python",
+    )
+
+    async def analyze() -> RepositoryAnalysis:
+        async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await AnalysisService(client=client).analyze_repository(context)
+
+    analysis = asyncio.run(analyze())
+
+    assert captured_request["url"] == "https://api.groq.com/openai/v1/chat/completions"
+    assert captured_request["authorization"] == "Bearer test-groq-key"
+    body = captured_request["body"]
+    assert isinstance(body, dict)
+    assert body["model"] == "openai/gpt-oss-20b"
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 1500
+    assert "acme/demo" in body["messages"][0]["content"]
+    assert analysis.executive_summary == "A repository."
+
+
 def test_analyze_route_returns_repository_details_and_analysis() -> None:
     context = RepositoryContext(
         name="demo",
