@@ -142,6 +142,7 @@ class AnalysisService:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 1500,
+            "response_format": {"type": "json_object"},
         }
         try:
             async with asyncio.timeout(self.analysis_timeout):
