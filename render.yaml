@@ -5,8 +5,8 @@ services:
     region: oregon
     plan: free
     rootDir: backend
-    dockerfilePath: backend/Dockerfile
-    dockerContext: backend
+    dockerfilePath: Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
       - key: AI_PROVIDER
