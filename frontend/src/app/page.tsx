@@ -81,7 +81,7 @@ const loadingStages = [
   'Writing the onboarding guide',
 ];
 
-const examples = ['fastapi/full-stack-fastapi-template', 'pallets/flask', 'insikizi23/autodev-ai'];
+const examples = ['fastapi/full-stack-fastapi-template', 'pallets/flask', 'insikizi23/repo-lens'];
 
 const commandKindLabels: Record<CommandKind, string> = {
   setup: 'Setup',
