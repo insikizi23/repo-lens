@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -19,6 +21,30 @@ from ..schemas.repository_analysis import (
     RepositoryMetadata,
 )
 from .facts_service import build_repository_facts
+
+
+logger = logging.getLogger(__name__)
+
+
+def _fit_lines(text: str, limit: int) -> tuple[str, bool]:
+    """Truncates text on a line boundary so quoted lines stay intact. Returns (text, was_cut)."""
+    if len(text) <= limit:
+        return text, False
+    cut = text.rfind("\n", 0, limit)
+    return text[: cut if cut > 0 else limit], True
+
+
+def _provider_error_message(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:500]
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if not isinstance(message, str):
+        return str(payload)[:500]
+    # Provider messages can include account identifiers, which end users should not see.
+    return re.sub(r"\borg_[A-Za-z0-9]+\b", "org_***", message)
 
 
 class AnalysisServiceError(Exception):
@@ -45,6 +71,9 @@ class AnalysisService:
         self.openai_key = os.getenv("OPENAI_API_KEY")
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.analysis_timeout = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "120"))
+        # Defaults keep prompt + output under Groq's free-tier per-request token ceiling (about 8K tokens).
+        self.max_prompt_chars = int(os.getenv("AI_MAX_PROMPT_CHARS", "12000"))
+        self.max_output_tokens = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "2500"))
 
     async def analyze_repository(
         self,
@@ -88,7 +117,7 @@ class AnalysisService:
             "model": self.ollama_model,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.2, "num_predict": 2000},
+            "options": {"temperature": 0.2, "num_predict": self.max_output_tokens},
             "prompt": prompt,
         }
 
@@ -136,7 +165,7 @@ class AnalysisService:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 4000,
+            "max_tokens": self.max_output_tokens,
             "response_format": {"type": "json_object"},
         }
         try:
@@ -149,11 +178,33 @@ class AnalysisService:
                 status_code=504,
             ) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 429:
+            status = exc.response.status_code
+            provider_message = _provider_error_message(exc.response)
+            # The provider's own message is the only way to diagnose these, so keep it in the server logs.
+            logger.warning("%s returned HTTP %s: %s", provider_name, status, provider_message)
+            if status == 413 or "request too large" in provider_message.lower():
                 raise AnalysisServiceError(
-                    f"{provider_name} rate limit reached. Please try again shortly.", status_code=429
+                    f"This repository is too large for the {provider_name} plan's request limit. "
+                    "Lower AI_MAX_PROMPT_CHARS or AI_MAX_OUTPUT_TOKENS on the API server.",
+                    status_code=413,
                 ) from exc
-            raise AnalysisServiceError(f"{provider_name} returned an error for the request.", status_code=503) from exc
+            if status == 429:
+                raise AnalysisServiceError(
+                    f"{provider_name} rate limit reached. Please wait a minute and try again.", status_code=429
+                ) from exc
+            if status in {401, 403}:
+                raise AnalysisServiceError(
+                    f"{provider_name} rejected the API key. Check the key in the API server's environment settings.",
+                    status_code=502,
+                ) from exc
+            if "json_validate_failed" in provider_message or "failed to generate json" in provider_message.lower():
+                raise AnalysisServiceError(
+                    "The AI model produced malformed output for this repository. Please try again.", status_code=502
+                ) from exc
+            raise AnalysisServiceError(
+                f"{provider_name} returned HTTP {status}: {provider_message[:200] or 'no details provided'}",
+                status_code=503,
+            ) from exc
         except httpx.HTTPError as exc:
             raise AnalysisServiceError(f"{provider_name} returned an unexpected network error.") from exc
 
@@ -251,20 +302,35 @@ class AnalysisService:
             f"- {language.name}: {language.percentage}% ({language.bytes} bytes)"
             for language in context.languages
         ) or "- No language data available"
-        file_tree = "\n".join(
-            f"- {entry.path}{'/' if entry.entry_type == 'tree' else ''}"
-            for entry in context.file_tree
-        ) or "- No file tree available"
-        readme_note = "README was truncated for safe analysis." if context.readme_truncated else ""
-        tree_note = "File tree was truncated for safe analysis." if context.file_tree_truncated else ""
-        source_files = "\n\n".join(
-            f"--- SOURCE FILE: {source.path} ---\n"
-            + "\n".join(f"{line_number}: {line}" for line_number, line in enumerate(source.content.splitlines(), 1))
-            for source in context.source_files
-        ) or "No source files could be inspected."
+        # Hosted free tiers reject oversized requests outright, so the README, tree, and sources
+        # share a fixed character budget. Commands and entry points are always included in full.
+        budget = self.max_prompt_chars
+        readme, readme_cut = _fit_lines(context.readme or "", int(budget * 0.25))
+        budget -= len(readme)
+        tree_lines = [f"- {entry.path}{'/' if entry.entry_type == 'tree' else ''}" for entry in context.file_tree]
+        file_tree, tree_cut = _fit_lines("\n".join(tree_lines), int(budget * 0.2))
+        budget -= len(file_tree)
+
+        source_blocks: list[str] = []
+        omitted_sources: list[str] = []
+        for source in context.source_files:
+            block = f"--- SOURCE FILE: {source.path} ---\n" + "\n".join(
+                f"{line_number}: {line}" for line_number, line in enumerate(source.content.splitlines(), 1)
+            )
+            if len(block) <= budget:
+                source_blocks.append(block)
+                budget -= len(block)
+            else:
+                omitted_sources.append(source.path)
+        source_files = "\n\n".join(source_blocks) or "No source files could be inspected."
+
+        readme_note = "README was truncated for analysis." if context.readme_truncated or readme_cut else ""
+        tree_note = "File tree was truncated for analysis." if context.file_tree_truncated or tree_cut else ""
+        skipped = context.source_files_skipped + len(omitted_sources)
         source_note = (
-            f"{context.source_files_skipped} other candidate source files were not inspected because of analysis limits."
-            if context.source_files_skipped
+            f"{skipped} other candidate source files were not included because of analysis limits"
+            + (f", including: {', '.join(omitted_sources)}." if omitted_sources else ".")
+            if skipped
             else ""
         )
         commands = "\n".join(
@@ -300,7 +366,7 @@ Likely entry points detected from file names and manifests:
 
 README ({context.readme_path}):
 --- README START ---
-{context.readme or 'No README available'}
+{readme or 'No README available'}
 --- README END ---
 {readme_note}
 

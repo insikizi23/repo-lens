@@ -18,7 +18,7 @@ from src.schemas.repository_analysis import (
     RepositorySourceFile,
     RepositoryTreeEntry,
 )
-from src.services.analysis_service import AnalysisService
+from src.services.analysis_service import AnalysisService, AnalysisServiceError
 from src.services.facts_service import build_repository_facts
 from src.services.github_service import GitHubService, GitHubServiceError
 from src.services.repository_service import RepositoryService
@@ -256,7 +256,7 @@ def test_analysis_service_uses_groq_when_configured(monkeypatch: pytest.MonkeyPa
     assert isinstance(body, dict)
     assert body["model"] == "openai/gpt-oss-20b"
     assert body["temperature"] == 0.2
-    assert body["max_tokens"] == 4000
+    assert body["max_tokens"] == 2500
     assert "acme/demo" in body["messages"][0]["content"]
     assert analysis.executive_summary == "A repository."
     assert analysis.recommendations[0].suggestion == "Add tests"
@@ -420,3 +420,48 @@ def test_analysis_verification_flags_unsupported_recommendations_and_paths() -> 
     assert (first.verified, first.line_start, first.line_end) == (True, 2, 2)
     assert (readme.verified, readme.line_start) == (True, 2)
     assert unsupported.verified is False and unsupported.quote == ""
+
+
+def test_prompt_stays_within_budget_and_names_omitted_files() -> None:
+    context = RepositoryContext(
+        name="demo",
+        owner="acme",
+        stars=0,
+        forks=0,
+        default_branch="main",
+        readme="intro line\n" * 2000,
+        file_tree=[RepositoryTreeEntry(path=f"src/module_{index}.py", entry_type="blob") for index in range(400)],
+        source_files=[RepositorySourceFile(path=f"src/module_{index}.py", content="x = 1\n" * 800) for index in range(6)],
+    )
+    service = AnalysisService()
+    prompt = service._build_prompt(context, build_repository_facts(context))
+
+    # Budgeted sections plus fixed instructions stay well under the provider's request ceiling.
+    assert len(prompt) < service.max_prompt_chars + 6000
+    assert "README was truncated" in prompt
+    assert "File tree was truncated" in prompt
+    assert "src/module_5.py" in prompt.split("--- SOURCE FILES END ---")[1]
+
+
+def test_groq_request_too_large_returns_actionable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            413,
+            json={"error": {"message": "Request too large for model in organization org_abc123 on tokens per minute (TPM): Limit 8000"}},
+        )
+
+    context = RepositoryContext(name="demo", owner="acme", stars=0, forks=0, default_branch="main")
+
+    async def analyze() -> RepositoryAnalysis:
+        async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await AnalysisService(client=client).analyze_repository(context)
+
+    with pytest.raises(AnalysisServiceError) as caught:
+        asyncio.run(analyze())
+
+    assert caught.value.status_code == 413
+    assert "too large" in caught.value.detail
+    assert "org_abc123" not in caught.value.detail
