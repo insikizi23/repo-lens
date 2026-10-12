@@ -4,7 +4,7 @@ RepoLens is an AI-powered onboarding guide for public GitHub repositories. It re
 
 ## Live Demo
 
-[Open RepoLens](https://frontend-omega-sepia-42.vercel.app/)
+[Open RepoLens](https://repo-lens-ai-42.vercel.app/)
 
 ## What It Does
 
