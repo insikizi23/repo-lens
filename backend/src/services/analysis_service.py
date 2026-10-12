@@ -34,17 +34,28 @@ def _fit_lines(text: str, limit: int) -> tuple[str, bool]:
     return text[: cut if cut > 0 else limit], True
 
 
-def _provider_error_message(response: httpx.Response) -> str:
+def _provider_error(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError:
-        return response.text[:500]
+        return {"message": response.text[:500]}
     error = payload.get("error") if isinstance(payload, dict) else None
-    message = error.get("message") if isinstance(error, dict) else None
-    if not isinstance(message, str):
-        return str(payload)[:500]
+    if not isinstance(error, dict):
+        return {"message": str(payload)[:500]}
+    message = error.get("message") if isinstance(error.get("message"), str) else ""
     # Provider messages can include account identifiers, which end users should not see.
-    return re.sub(r"\borg_[A-Za-z0-9]+\b", "org_***", message)
+    return {**error, "message": re.sub(r"\borg_[A-Za-z0-9]+\b", "org_***", message)}
+
+
+def _parse_json_object(text: str) -> Any:
+    """Parses a model reply that should be a JSON object, tolerating code fences or stray prose around it."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(text[start : end + 1])
 
 
 class AnalysisServiceError(Exception):
@@ -72,8 +83,9 @@ class AnalysisService:
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.analysis_timeout = float(os.getenv("ANALYSIS_TIMEOUT_SECONDS", "120"))
         # Defaults keep prompt + output under Groq's free-tier per-request token ceiling (about 8K tokens).
-        self.max_prompt_chars = int(os.getenv("AI_MAX_PROMPT_CHARS", "12000"))
-        self.max_output_tokens = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "2500"))
+        self.max_prompt_chars = int(os.getenv("AI_MAX_PROMPT_CHARS", "10000"))
+        self.max_output_tokens = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "3500"))
+        self.reasoning_effort = os.getenv("AI_REASONING_EFFORT", "low").strip().lower()
 
     async def analyze_repository(
         self,
@@ -161,13 +173,17 @@ class AnalysisService:
         provider_name: str,
     ) -> RepositoryAnalysis:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        body = {
+        body: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": self.max_output_tokens,
             "response_format": {"type": "json_object"},
         }
+        # gpt-oss models reason before answering, and that reasoning counts against max_tokens.
+        # Keeping it short leaves room for the JSON answer instead of cutting it off mid-object.
+        if "gpt-oss" in model and self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
         try:
             async with asyncio.timeout(self.analysis_timeout):
                 response = await self.client.post(f"{base_url}/chat/completions", json=body, headers=headers)
@@ -179,9 +195,22 @@ class AnalysisService:
             ) from exc
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            provider_message = _provider_error_message(exc.response)
+            provider_error = _provider_error(exc.response)
+            provider_message = provider_error["message"]
             # The provider's own message is the only way to diagnose these, so keep it in the server logs.
             logger.warning("%s returned HTTP %s: %s", provider_name, status, provider_message)
+            if provider_error.get("code") == "json_validate_failed":
+                # Groq returns the rejected output; it is often valid JSON wrapped in extra text.
+                failed_generation = provider_error.get("failed_generation")
+                try:
+                    return RepositoryAnalysis.model_validate(_parse_json_object(str(failed_generation or "")))
+                except (json.JSONDecodeError, ValidationError) as parse_exc:
+                    logger.warning("Could not recover %s output (%d chars): %s", provider_name, len(str(failed_generation or "")), parse_exc)
+                    raise AnalysisServiceError(
+                        "The AI model's answer was cut off or malformed. Please try again; if it keeps happening, "
+                        "raise AI_MAX_OUTPUT_TOKENS or lower AI_MAX_PROMPT_CHARS on the API server.",
+                        status_code=502,
+                    ) from exc
             if status == 413 or "request too large" in provider_message.lower():
                 raise AnalysisServiceError(
                     f"This repository is too large for the {provider_name} plan's request limit. "
@@ -197,10 +226,6 @@ class AnalysisService:
                     f"{provider_name} rejected the API key. Check the key in the API server's environment settings.",
                     status_code=502,
                 ) from exc
-            if "json_validate_failed" in provider_message or "failed to generate json" in provider_message.lower():
-                raise AnalysisServiceError(
-                    "The AI model produced malformed output for this repository. Please try again.", status_code=502
-                ) from exc
             raise AnalysisServiceError(
                 f"{provider_name} returned HTTP {status}: {provider_message[:200] or 'no details provided'}",
                 status_code=503,
@@ -208,6 +233,7 @@ class AnalysisService:
         except httpx.HTTPError as exc:
             raise AnalysisServiceError(f"{provider_name} returned an unexpected network error.") from exc
 
+        first_choice: Any = None
         try:
             result = response.json()
             choices = result.get("choices")
@@ -222,9 +248,15 @@ class AnalysisService:
             if not isinstance(content, str):
                 raise AnalysisServiceError(f"{provider_name} returned an unexpected response format.")
 
-            parsed = json.loads(content)
-            return RepositoryAnalysis.model_validate(parsed)
+            return RepositoryAnalysis.model_validate(_parse_json_object(content))
         except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+            finish_reason = first_choice.get("finish_reason") if isinstance(first_choice, dict) else None
+            logger.warning("%s returned an unparseable analysis (finish_reason=%s): %s", provider_name, finish_reason, exc)
+            if finish_reason == "length":
+                raise AnalysisServiceError(
+                    "The AI model ran out of room before finishing its answer. Please try again; if it keeps happening, "
+                    "raise AI_MAX_OUTPUT_TOKENS on the API server.",
+                ) from exc
             raise AnalysisServiceError("The model returned an invalid analysis. Please try again.") from exc
 
     @staticmethod
@@ -388,12 +420,14 @@ Return only a JSON object with exactly these keys:
 - folder_responsibilities: list of strings, "folder/: responsibility".
 - first_steps: ordered list of concrete actions for a new contributor's first day. Reference the extracted commands above where relevant.
 - reading_order: 3-6 objects {{"path", "reason"}} naming the files to read first and why, in order. Paths must appear in the file tree.
-- recommendations: up to 5 objects {{"suggestion", "rationale", "path", "quote"}}. Each must be specific to this repository:
+- recommendations: up to 4 objects {{"suggestion", "rationale", "path", "quote"}}. Each must be specific to this repository:
   what to change, why it matters, and a quote copied exactly from the file at "path" (a source file or the README) that shows the issue.
   Skip generic advice such as "add more tests" unless a quoted file shows the specific gap.
 - unknowns: list of strings naming important questions the supplied context cannot answer (for example missing setup docs or
   files that were not inspected).
-- evidence: objects {{"claim", "path", "quote"}} supporting key claims in the summary and architecture; quote must be copied exactly from a supplied file.
+- evidence: up to 4 objects {{"claim", "path", "quote"}} supporting key claims in the summary and architecture; quote must be copied exactly from a supplied file.
 
 Every quote is checked against the real file before it is shown; quotes that do not match are discarded.
+Keep the answer compact: each quote should be a single line from the file, each list item one sentence, and every list at most 6 items.
+Output the JSON object only, with no text before or after it.
 """

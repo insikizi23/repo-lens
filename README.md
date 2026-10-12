@@ -146,8 +146,9 @@ Backend variables are loaded from `backend/.env`.
 | `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama API address. |
 | `OLLAMA_MODEL` | No | `llama3.2:1b` | Local model used for analysis. |
 | `ANALYSIS_TIMEOUT_SECONDS` | No | `120` | Maximum total time allowed for one model analysis. |
-| `AI_MAX_PROMPT_CHARS` | No | `12000` | Character budget for the README, file tree, and source files sent to the model. Commands and entry points are always included. |
-| `AI_MAX_OUTPUT_TOKENS` | No | `2500` | Maximum tokens the model may generate. Together with the prompt this must fit the provider's per-request limit (about 8K tokens on Groq's free tier for `openai/gpt-oss-20b`). |
+| `AI_MAX_PROMPT_CHARS` | No | `10000` | Character budget for the README, file tree, and source files sent to the model. Commands and entry points are always included. |
+| `AI_MAX_OUTPUT_TOKENS` | No | `3500` | Maximum tokens the model may generate, including hidden reasoning for `gpt-oss` models. Together with the prompt this must fit the provider's per-request limit (about 8K tokens on Groq's free tier for `openai/gpt-oss-20b`). |
+| `AI_REASONING_EFFORT` | No | `low` | Reasoning effort sent to `gpt-oss` models. Low leaves more of the output budget for the answer; set it empty to omit the parameter. |
 
 Frontend variables are loaded from `frontend/.env.local`.
 

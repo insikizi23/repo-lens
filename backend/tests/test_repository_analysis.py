@@ -256,7 +256,8 @@ def test_analysis_service_uses_groq_when_configured(monkeypatch: pytest.MonkeyPa
     assert isinstance(body, dict)
     assert body["model"] == "openai/gpt-oss-20b"
     assert body["temperature"] == 0.2
-    assert body["max_tokens"] == 2500
+    assert body["max_tokens"] == 3500
+    assert body["reasoning_effort"] == "low"
     assert "acme/demo" in body["messages"][0]["content"]
     assert analysis.executive_summary == "A repository."
     assert analysis.recommendations[0].suggestion == "Add tests"
@@ -465,3 +466,43 @@ def test_groq_request_too_large_returns_actionable_error(monkeypatch: pytest.Mon
     assert caught.value.status_code == 413
     assert "too large" in caught.value.detail
     assert "org_abc123" not in caught.value.detail
+
+
+@pytest.mark.parametrize(
+    ("failed_generation", "recovered"),
+    [
+        ('Here is the analysis: {"executive_summary": "Recovered.", "architecture_overview": "A service."} Done.', True),
+        ('{"executive_summary": "Cut off mid-answ', False),
+    ],
+)
+def test_groq_json_validation_failure_is_recovered_when_possible(
+    monkeypatch: pytest.MonkeyPatch, failed_generation: str, recovered: bool
+) -> None:
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Failed to validate JSON. Please adjust your prompt. See 'failed_generation' for more details.",
+                    "type": "invalid_request_error",
+                    "code": "json_validate_failed",
+                    "failed_generation": failed_generation,
+                }
+            },
+        )
+
+    context = RepositoryContext(name="demo", owner="acme", stars=0, forks=0, default_branch="main")
+
+    async def analyze() -> RepositoryAnalysis:
+        async with AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await AnalysisService(client=client).analyze_repository(context)
+
+    if recovered:
+        assert asyncio.run(analyze()).executive_summary == "Recovered."
+    else:
+        with pytest.raises(AnalysisServiceError) as caught:
+            asyncio.run(analyze())
+        assert "cut off or malformed" in caught.value.detail
