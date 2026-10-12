@@ -8,6 +8,7 @@ from ...schemas.repository_analysis import (
     RepositoryDetails,
 )
 from ...services.analysis_service import AnalysisService, AnalysisServiceError
+from ...services.facts_service import build_repository_facts
 from ...services.github_service import GitHubService, GitHubServiceError
 
 router = APIRouter(prefix="/api", tags=["analysis"])
@@ -31,8 +32,10 @@ async def analyze_repository(payload: RepositoryAnalysisRequest) -> RepositoryAn
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Unable to fetch repository metadata from GitHub") from exc
 
+    facts = build_repository_facts(context)
+
     try:
-        analysis = await analysis_service.analyze_repository(context)
+        analysis = await analysis_service.analyze_repository(context, facts)
         return RepositoryAnalysisResult(
             repository=RepositoryDetails(
                 name=context.name,
@@ -44,6 +47,7 @@ async def analyze_repository(payload: RepositoryAnalysisRequest) -> RepositoryAn
                 primary_language=context.primary_language,
                 languages=context.languages,
             ),
+            facts=facts,
             analysis=analysis,
         )
     except AnalysisServiceError as exc:

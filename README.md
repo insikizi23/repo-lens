@@ -1,6 +1,6 @@
 # RepoLens
 
-RepoLens is an AI-powered GitHub repository intelligence application. Paste a public GitHub repository URL to retrieve real repository metadata, language data, README content, and a bounded file tree, then receive structured engineering insights from Groq or a local Ollama model.
+RepoLens is an AI-powered onboarding guide for public GitHub repositories. It retrieves repository metadata, README content, a bounded file tree, and a small curated sample of project/source files, then produces practical first steps and engineering insights with source excerpts verified against the retrieved files.
 
 ## Live Demo
 
@@ -9,10 +9,14 @@ RepoLens is an AI-powered GitHub repository intelligence application. Paste a pu
 ## What It Does
 
 - Validates public GitHub repository URLs without fetching arbitrary websites.
-- Retrieves repository metadata, language breakdown, README, and recursive file tree through GitHub's REST API.
-- Bounds README and file-tree content before it reaches the model, so very large repositories remain safe to analyze.
-- Generates typed engineering insights: executive summary, technologies, architecture, components, folder responsibilities, and improvements.
-- Displays retrieved GitHub facts separately from the AI analysis.
+- Retrieves repository metadata, language breakdown, README, recursive file tree, and selected source/configuration files through GitHub's REST API.
+- Bounds README to 20,000 characters, the file tree to 500 entries, and source context to 12 files / 60 KB.
+- Extracts setup, run, test, and build commands directly from `package.json` scripts, Makefiles, `pyproject.toml`, lockfiles, and README shell blocks, with links to the exact line. No AI is involved in this step.
+- Detects likely entry points from file names and package manifests.
+- Generates a reading order, first steps, architecture overview, and repository-specific recommendations with an AI model.
+- Verifies every quote and file path the model returns against the retrieved files. Recommendations without a matching quote are labeled as unverified, and invented paths are dropped.
+- Lists open questions the model could not answer and reports exactly which files were and were not inspected.
+- Labels each section as either taken from the repository or AI generated.
 
 ## Architecture
 
@@ -48,12 +52,13 @@ API route → GitHubService → RepositoryContext → AnalysisService → Pydant
 
 1. The user submits a URL such as `https://github.com/vercel/next.js`.
 2. FastAPI validates and parses the owner and repository name.
-3. `GitHubService` retrieves real repository metadata, languages, README, and file-tree entries.
+3. `GitHubService` retrieves repository metadata, languages, README, file-tree entries, and selected source files.
 4. The service creates a bounded `RepositoryContext`:
    - README is limited to 20,000 characters.
    - File tree is limited to 500 entries.
-5. `AnalysisService` supplies that context to Ollama in JSON mode, then validates the result with Pydantic.
-6. The frontend displays the repository facts and the structured engineering analysis.
+   - Up to 12 high-value setup, entry-point, route, and test files are selected, capped at 12 KB each and 60 KB total.
+5. `AnalysisService` requests an evidence-based onboarding guide, validates the result with Pydantic, and checks source quotes before attaching line numbers.
+6. The frontend displays repository facts, first steps, recommendations, and links to verified source evidence.
 
 ## Local Development
 
@@ -146,7 +151,7 @@ Frontend variables are loaded from `frontend/.env.local`.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_API_BASE_URL` | No | `http://127.0.0.1:8000` | Backend API base URL. |
+| `NEXT_PUBLIC_API_BASE_URL` | Production only | Local: `http://127.0.0.1:8000` | Backend API base URL, for example `https://repo-lens-tdpr.onrender.com`. Production builds show a configuration error when it is missing. |
 
 ## Deployment
 
@@ -171,7 +176,7 @@ RepoLens uses Vercel for the Next.js frontend and Render for the FastAPI API. Pr
    AI_PROVIDER=groq
    GROQ_API_KEY=<your Groq API key>
    GROQ_MODEL=openai/gpt-oss-20b
-   CORS_ORIGINS=https://frontend-omega-sepia-42.vercel.app
+   CORS_ORIGINS=https://repo-lens-ai-42.vercel.app,https://frontend-omega-sepia-42.vercel.app
    GITHUB_TOKEN=<optional GitHub token>
    ```
 
@@ -189,6 +194,8 @@ RepoLens uses Vercel for the Next.js frontend and Render for the FastAPI API. Pr
 3. Deploy the project. When the API URL changes, update `NEXT_PUBLIC_API_BASE_URL` and redeploy Vercel. If the frontend URL changes, update Render's `CORS_ORIGINS` value and redeploy Render.
 
 For local development, set `AI_PROVIDER=ollama` and use the Ollama settings in `backend/.env.example`.
+
+If analysis fails in the deployed site, open the API health URL (`https://<your-render-service>.onrender.com/health`). It should return `{"status":"ok"}`. A browser `NetworkError` can mean the API is unavailable, the frontend is using the wrong `NEXT_PUBLIC_API_BASE_URL`, or the API's `CORS_ORIGINS` does not include the exact Vercel site origin. Vercel can redirect one domain to another (for example `frontend-omega-sepia-42.vercel.app` to `repo-lens-ai-42.vercel.app`), so list every domain the site is served from. After changing Render environment settings, redeploy the API; after changing the frontend API URL, redeploy Vercel.
 
 ## Testing
 

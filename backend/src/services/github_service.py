@@ -12,6 +12,7 @@ import httpx
 from ..schemas.repository_analysis import (
     RepositoryContext,
     RepositoryLanguage,
+    RepositorySourceFile,
     RepositoryTreeEntry,
 )
 
@@ -36,11 +37,17 @@ class GitHubService:
         client: httpx.AsyncClient | None = None,
         max_readme_characters: int = 20_000,
         max_tree_entries: int = 500,
+        max_source_files: int = 12,
+        max_source_file_bytes: int = 12_000,
+        max_source_total_bytes: int = 60_000,
     ) -> None:
         self.github_token = github_token if github_token is not None else os.getenv("GITHUB_TOKEN")
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0))
         self.max_readme_characters = max_readme_characters
         self.max_tree_entries = max_tree_entries
+        self.max_source_files = max_source_files
+        self.max_source_file_bytes = max_source_file_bytes
+        self.max_source_total_bytes = max_source_total_bytes
 
     def parse_repository_url(self, repository_url: str) -> tuple[str, str]:
         match = self._repository_url_pattern.match(repository_url.strip())
@@ -54,11 +61,17 @@ class GitHubService:
 
         repository = await self._get_json(f"/repos/{owner}/{repo}", headers)
         languages = await self._get_json(f"/repos/{owner}/{repo}/languages", headers)
-        readme, readme_truncated = await self._fetch_readme(owner, repo, headers)
-        file_tree, file_tree_truncated = await self._fetch_file_tree(
+        readme, readme_path, readme_truncated = await self._fetch_readme(owner, repo, headers)
+        file_tree, file_tree_total, file_tree_truncated = await self._fetch_file_tree(
             owner,
             repo,
             repository.get("default_branch", "main"),
+            headers,
+        )
+        source_files, source_files_skipped = await self._fetch_source_files(
+            owner,
+            repo,
+            file_tree,
             headers,
         )
 
@@ -72,39 +85,45 @@ class GitHubService:
             primary_language=repository.get("language"),
             languages=self._language_breakdown(languages),
             readme=readme,
+            readme_path=readme_path,
             readme_truncated=readme_truncated,
             file_tree=file_tree,
+            file_tree_total=file_tree_total,
             file_tree_truncated=file_tree_truncated,
+            source_files=source_files,
+            source_files_skipped=source_files_skipped,
+            source_files_truncated=source_files_skipped > 0,
         )
 
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
-            "User-Agent": "CodeAtlas",
+            "User-Agent": "RepoLens",
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
         return headers
 
-    async def _fetch_readme(self, owner: str, repo: str, headers: dict[str, str]) -> tuple[str | None, bool]:
+    async def _fetch_readme(self, owner: str, repo: str, headers: dict[str, str]) -> tuple[str | None, str, bool]:
         try:
             payload = await self._get_json(f"/repos/{owner}/{repo}/readme", headers)
         except GitHubServiceError as exc:
             if exc.status_code == 404:
-                return None, False
+                return None, "README.md", False
             raise
 
+        path = payload.get("path") if isinstance(payload.get("path"), str) else "README.md"
         encoded_content = payload.get("content")
         if not isinstance(encoded_content, str):
-            return None, False
+            return None, path, False
 
         try:
             decoded = base64.b64decode(encoded_content, validate=False).decode("utf-8", errors="replace")
         except (binascii.Error, ValueError):
-            return None, False
+            return None, path, False
 
-        return decoded[: self.max_readme_characters], len(decoded) > self.max_readme_characters
+        return decoded[: self.max_readme_characters], path, len(decoded) > self.max_readme_characters
 
     async def _fetch_file_tree(
         self,
@@ -112,7 +131,7 @@ class GitHubService:
         repo: str,
         branch: str,
         headers: dict[str, str],
-    ) -> tuple[list[RepositoryTreeEntry], bool]:
+    ) -> tuple[list[RepositoryTreeEntry], int | None, bool]:
         branch_reference = quote(branch, safe="")
         payload = await self._get_json(
             f"/repos/{owner}/{repo}/git/trees/{branch_reference}?recursive=1",
@@ -123,11 +142,96 @@ class GitHubService:
             raw_entries = []
 
         entries = [
-            RepositoryTreeEntry(path=entry["path"], entry_type=entry.get("type", "unknown"))
+            RepositoryTreeEntry(
+                path=entry["path"],
+                entry_type=entry.get("type", "unknown"),
+                sha=entry.get("sha"),
+                size=entry.get("size"),
+            )
             for entry in raw_entries[: self.max_tree_entries]
             if isinstance(entry, dict) and isinstance(entry.get("path"), str)
         ]
-        return entries, bool(payload.get("truncated")) or len(raw_entries) > self.max_tree_entries
+        # GitHub truncates very large trees itself, in which case the real total is unknown.
+        github_truncated = bool(payload.get("truncated"))
+        total = None if github_truncated else len(raw_entries)
+        return entries, total, github_truncated or len(raw_entries) > self.max_tree_entries
+
+    async def _fetch_source_files(
+        self,
+        owner: str,
+        repo: str,
+        file_tree: list[RepositoryTreeEntry],
+        headers: dict[str, str],
+    ) -> tuple[list[RepositorySourceFile], int]:
+        candidates = sorted(
+            (
+                entry
+                for entry in file_tree
+                if entry.entry_type == "blob"
+                and entry.sha
+                and entry.size is not None
+                and 0 <= entry.size <= self.max_source_file_bytes
+                and self._source_file_priority(entry.path) > 0
+            ),
+            key=lambda entry: (-self._source_file_priority(entry.path), entry.path.count("/"), entry.path),
+        )
+        selected: list[RepositorySourceFile] = []
+        total_bytes = 0
+
+        for entry in candidates:
+            if len(selected) >= self.max_source_files or total_bytes >= self.max_source_total_bytes:
+                break
+            try:
+                payload = await self._get_json(
+                    f"/repos/{owner}/{repo}/git/blobs/{entry.sha}",
+                    headers,
+                )
+            except GitHubServiceError as exc:
+                if exc.status_code == 404:
+                    continue
+                raise
+
+            encoded_content = payload.get("content")
+            if payload.get("encoding") != "base64" or not isinstance(encoded_content, str):
+                continue
+            try:
+                content = base64.b64decode(encoded_content, validate=False).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                continue
+
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > self.max_source_file_bytes or total_bytes + content_bytes > self.max_source_total_bytes:
+                continue
+            selected.append(RepositorySourceFile(path=entry.path, content=content))
+            total_bytes += content_bytes
+
+        return selected, len(candidates) - len(selected)
+
+    @staticmethod
+    def _source_file_priority(path: str) -> int:
+        normalized = path.lower()
+        parts = normalized.split("/")
+        if any(part in {"node_modules", "vendor", "dist", "build", "coverage", ".next", ".venv", "target"} for part in parts):
+            return 0
+        name = parts[-1]
+        if name.endswith((".lock", ".min.js", ".min.css")) or name.endswith((".map", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".pdf")):
+            return 0
+        if name in {
+            "package.json", "pyproject.toml", "requirements.txt", "pom.xml", "build.gradle",
+            "build.gradle.kts", "cargo.toml", "go.mod", "composer.json", "gemfile", "makefile", "justfile",
+        }:
+            return 100
+        if name in {"main.py", "app.py", "main.ts", "main.tsx", "index.ts", "index.tsx", "server.ts", "server.js"}:
+            return 90
+        if any(part in {"routes", "api", "pages"} for part in parts) or name in {"page.tsx", "page.ts", "route.ts", "router.py"}:
+            return 80
+        if name in {"dockerfile", "docker-compose.yml", "compose.yml", "tsconfig.json", "next.config.js", "next.config.ts"}:
+            return 70
+        if "test" in parts or "tests" in parts or "spec" in name or "test" in name:
+            return 60
+        if name.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".go", ".cs", ".rb", ".php", ".rs", ".kt", ".swift")):
+            return 50 if "src" in parts else 40
+        return 0
 
     async def _get_json(self, path: str, headers: dict[str, str]) -> dict[str, Any]:
         try:
@@ -146,7 +250,16 @@ class GitHubService:
     def _translate_status_error(self, exc: httpx.HTTPStatusError) -> GitHubServiceError:
         response = exc.response
         if response.status_code == 404:
-            return GitHubServiceError("Repository not found or not publicly accessible.", status_code=404)
+            return GitHubServiceError(
+                "Repository not found. RepoLens only works with public GitHub repositories, so check the URL or whether the repository is private.",
+                status_code=404,
+            )
+        if response.status_code == 401:
+            # GitHub rejects requests with a bad token even for public repositories.
+            return GitHubServiceError(
+                "GitHub rejected the server's GITHUB_TOKEN. Replace or remove it in the API's environment settings.",
+                status_code=502,
+            )
         if response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0":
             return GitHubServiceError(
                 "GitHub API rate limit reached. Add GITHUB_TOKEN and try again.",
